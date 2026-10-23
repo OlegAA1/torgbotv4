@@ -3,6 +3,7 @@ import { TOP_DOWN_MACD_EMA_TIMEFRAMES } from "./experimental-strategies";
 import { getMarketData } from "./market-data-service";
 import { marketCandleCloseTime } from "./market-calendar";
 import { syncPaperCandidates } from "./paper-trading-store";
+import { formatSignalMessage, notifySafely } from "./telegram-notifier.mjs";
 import { buildForecast, SCENARIO_MODEL_VERSION } from "./terminal-forecast";
 import type { Candle, ForecastDecision, Market, SignalIdea, Timeframe } from "./terminal-types";
 
@@ -104,6 +105,10 @@ export async function scanForecastAsset(input: ForecastScanRequest) {
   const preciseCandles = allTimeframes["1m"] ?? [];
   const saved = await recordForecast(request.symbol, request.market, request.timeframe!, forecast, baseCandles, preciseCandles);
   const paperQueued = saved.created ? await syncPaperCandidates() : 0;
+  // Only a newly recorded READY signal of the allowed pilot is announced, once per closed candle.
+  if (saved.created && forecast.decision === "READY" && forecast.strategyPolicy?.eligible) {
+    notifySafely("signal", () => formatSignalMessage({ symbol: request.symbol, timeframe: request.timeframe!, forecast }), `signal:${saved.id}`);
+  }
   return {
     symbol: request.symbol,
     market: request.market,

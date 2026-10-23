@@ -5,6 +5,7 @@ import { SCENARIO_MODEL_VERSION } from "./terminal-forecast";
 import { policyAllowsPaperEntry, STRATEGY_POLICY_VERSION } from "./strategy-policy";
 import { correlationGroupExposure, correlationGroupLimitReason, DEFAULT_MAX_POSITIONS_PER_GROUP, MAX_POSITIONS_PER_GROUP_LIMIT } from "./correlation-groups";
 import { fundingCostPct, marketCostProfile } from "./market-costs";
+import { formatEntrySkipped, formatTradeClosed, formatTradeOpened, notifySafely } from "./telegram-notifier.mjs";
 import type {
   Candle,
   ForecastDecision,
@@ -931,6 +932,8 @@ export async function guardAutomaticPaperOverlap(db: D1, candidate: PaperInterva
       entry_block_reason = 'DUPLICATE_SYMBOL', entry_block_detail = ?, entry_blocked_at = ?, updated_at = ?
       WHERE id = ? AND status = 'CANDIDATE'`)
       .bind(conflict.detail, now, now, candidate.id).run();
+    const row = candidate as Partial<TradeRow>;
+    if (row.symbol && row.side) announceSkipped(row as Pick<TradeRow, "id" | "symbol" | "side" | "timeframe">, "OVERLAP", conflict.detail);
   }
   return false;
 }
@@ -938,6 +941,32 @@ export async function guardAutomaticPaperOverlap(db: D1, candidate: PaperInterva
 async function skipTrade(db: D1, id: string, reason: Exclude<PaperTradeExitReason, null>) {
   await db.prepare("UPDATE paper_trades SET status = 'SKIPPED', exit_reason = ?, entry_block_reason = NULL, entry_block_detail = NULL, entry_blocked_at = NULL, updated_at = ? WHERE id = ?")
     .bind(reason, Date.now(), id).run();
+}
+
+// Telegram notices are queued fire-and-forget after the database change is committed;
+// notifySafely never throws, so a notification problem cannot affect trade accounting.
+function announceOpened(trade: TradeRow, fill: { entryPrice: number; quantity: number; riskAmount: number },
+  costs: PaperTradeCosts, details: { manual: boolean; scaleIn?: boolean; quoteCurrency: string }) {
+  notifySafely("trade", () => formatTradeOpened({
+    symbol: trade.symbol, timeframe: trade.timeframe, side: trade.side, entryPrice: fill.entryPrice, quantity: fill.quantity,
+    stopPrice: trade.stop_price, targetPrice: trade.target_price, riskAmount: fill.riskAmount, quoteCurrency: details.quoteCurrency,
+    feeBps: costs.feeBps, slippageBps: costs.slippageBps, manual: details.manual, scaleIn: details.scaleIn,
+  }), `open:${trade.id}`);
+}
+
+function announceClosed(trade: TradeRow, result: { exitPrice: number | null; exitReason: PaperTradeExitReason; exitTime: number | null;
+  realizedPnl: number | null; pnlPct: number | null; fees: number }) {
+  if (result.realizedPnl == null) return;
+  notifySafely("trade", () => formatTradeClosed({
+    symbol: trade.symbol, side: trade.side, entryPrice: trade.entry_price, exitPrice: result.exitPrice, exitReason: result.exitReason,
+    entryTime: trade.first_entry_time ?? trade.entry_time, exitTime: result.exitTime, realizedPnl: result.realizedPnl,
+    pnlPct: result.pnlPct, fees: result.fees,
+  }), `close:${trade.id}`);
+}
+
+function announceSkipped(trade: Pick<TradeRow, "id" | "symbol" | "side" | "timeframe">, reason: string, detail: string) {
+  notifySafely("trade", () => formatEntrySkipped({ symbol: trade.symbol, side: trade.side, timeframe: trade.timeframe, detail }),
+    `skip:${trade.id}:${reason}`);
 }
 
 async function blockCandidate(
@@ -953,6 +982,7 @@ async function blockCandidate(
     WHERE id = ? AND status = 'CANDIDATE'`).bind(
     reason, detail, now, candle?.close ?? null, candle?.time ?? null, now, trade.id,
   ).run();
+  if (reason === "POSITION_LIMIT" && trade.entry_block_reason !== reason) announceSkipped(trade, reason, detail);
 }
 
 async function mergeCandidateIntoOpenTrade(
@@ -1166,7 +1196,9 @@ async function openAutomaticCandidateAtSignal(db: D1, account: AccountRow, trade
       executionWouldOpen ? null : "WAIT_BETTER_PRICE", `[${PAPER_ENTRY_POLICY_VERSION}] ${shadowDetail}; статистический вход по закрытию свечи сигнала, сопровождение только после её закрытия`,
       executionWouldOpen ? null : now, entryTime - 60_000, costs.feeBps, costs.slippageBps, costs.fundingBpsPer8h, now, trade.id,
     ).run();
-  return Number(updated.meta.changes ?? 0) > 0;
+  const opened = Number(updated.meta.changes ?? 0) > 0;
+  if (opened) announceOpened(trade, entry, costs, { manual: false, quoteCurrency: currency.quoteCurrency });
+  return opened;
 }
 
 async function openReadyCandidatesAtSignal(db: D1, account: AccountRow) {
@@ -1351,6 +1383,7 @@ async function runOpenManualCandidateNow(db: D1, account: AccountRow, trade: Tra
         added.feesNative, latest.close, latest.time, now, trade.id,
       ),
     ]);
+    announceOpened(trade, added, positionCosts, { manual: true, scaleIn: true, quoteCurrency: currency.quoteCurrency });
     return { evaluated: 1, balanceDelta: 0, openedNow: true, addedNow: true, entryPrice: added.entryPrice, entryTime: now };
   }
 
@@ -1383,6 +1416,7 @@ async function runOpenManualCandidateNow(db: D1, account: AccountRow, trade: Tra
     entry.unrealizedPnl, entry.unrealizedPnlNative, entry.unrealizedPnlPct, latest.close, latest.time,
     costs.feeBps, costs.slippageBps, costs.fundingBpsPer8h, now, trade.id,
   ).run();
+  announceOpened(trade, entry, costs, { manual: trade.entry_source !== "AUTO", quoteCurrency: currency.quoteCurrency });
   return { evaluated: 1, balanceDelta: 0, openedNow: true, addedNow: false, entryPrice: entry.entryPrice, entryTime: entryTimestamp };
 }
 
@@ -1453,6 +1487,8 @@ async function processTrade(db: D1, account: AccountRow, trade: TradeRow, execut
   if (simulation.status === "CLOSED" && trade.status !== "CLOSED" && realizedPnlBase != null) {
     await db.prepare("UPDATE paper_accounts SET balance = balance + ?, updated_at = ? WHERE id = ?")
       .bind(realizedPnlBase, Date.now(), ACCOUNT_ID).run();
+    announceClosed(trade, { exitPrice: simulation.exitPrice, exitReason: simulation.exitReason, exitTime: simulation.exitTime,
+      realizedPnl: realizedPnlBase, pnlPct: simulation.pnlPct, fees: feesBase });
     return { evaluated: 1, balanceDelta: realizedPnlBase };
   }
   return { evaluated: 1, balanceDelta: 0 };
@@ -2229,6 +2265,8 @@ async function runClosePaperTrade(tradeId: string) {
   if (Number(results[0]?.meta?.changes ?? 0) !== 1) {
     throw new Error("Позиция уже была закрыта другим обновлением");
   }
+  announceClosed(trade, { exitPrice: close.exitPrice, exitReason: "MANUAL_CLOSE", exitTime: now, realizedPnl: close.realizedPnl,
+    pnlPct: close.pnlPct, fees: close.fees });
 
   return {
     ...(await payload(db, 0, 1)),

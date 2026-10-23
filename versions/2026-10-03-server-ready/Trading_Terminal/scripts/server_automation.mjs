@@ -2,6 +2,7 @@ import { readFile, mkdir, appendFile, writeFile, rename } from 'node:fs/promises
 import { dirname, resolve } from 'node:path';
 import { mergeAssets, runWithConcurrency, summarizeScanResults, positiveInteger } from './automation_daemon.mjs';
 import { recurring } from '../server/loops.mjs';
+import { createScanWatch, getNotifier } from '../app/telegram-notifier.mjs';
 
 const controller = new AbortController();
 for (const event of ['SIGINT', 'SIGTERM']) process.on(event, () => controller.abort());
@@ -45,10 +46,15 @@ async function scan() {
   await appendFile(resolve(directory, 'automation_runs.jsonl'), JSON.stringify(run) + '\n');
   await api('/api/automation/status', { action: 'record-run', run });
   console.log(`Scan: ${run.created} new, ${run.existing} existing, ${run.failed} errors`);
+  if (!controller.signal.aborted) scanWatch.recordRun({ results });
+}
+const scanWatch = createScanWatch(text => getNotifier().send('alert', text));
+async function watchedScan() {
+  try { await scan(); } catch (error) { if (!controller.signal.aborted) scanWatch.recordCrash(error.message); throw error; }
 }
 const log = error => { if (!controller.signal.aborted) console.error(`[${new Date().toISOString()}] ${error.message}`); };
 await Promise.all([
-  recurring(scan, positiveInteger(process.env.NORTHSTAR_AUTOMATION_SCAN_INTERVAL_SECONDS, config.scanIntervalSeconds, 60) * 1000, controller.signal, log),
+  recurring(watchedScan, positiveInteger(process.env.NORTHSTAR_AUTOMATION_SCAN_INTERVAL_SECONDS, config.scanIntervalSeconds, 60) * 1000, controller.signal, log),
   recurring(() => api('/api/paper-trades?evaluate=1'), positiveInteger(process.env.NORTHSTAR_AUTOMATION_EVALUATION_INTERVAL_SECONDS, config.evaluationIntervalSeconds, 15, 3600) * 1000, controller.signal, log),
   recurring(() => api('/api/automation/status', { action: 'heartbeat', at: Date.now() }, 10_000), 30_000, controller.signal, log),
 ]);

@@ -67,6 +67,14 @@ MOEX использует прямой ISS. Windows-мост `127.0.0.1:3021` н
 его необязательный fallback не является серверным источником. Проверьте доступ
 к Bybit/OKX/Yahoo/MOEX с конкретного сервера до включения автоторговли.
 
+## Telegram-уведомления
+
+Необязательно. Сигналы «ГОТОВ», открытие и закрытие виртуальных сделок, запуск и остановка сервера
+и проблемы сканера приходят в Telegram. Добавьте в `.env.server` `TELEGRAM_BOT_TOKEN` и
+`TELEGRAM_CHAT_ID`, затем `docker compose up -d --force-recreate` и проверьте
+`docker compose exec terminal node scripts/telegram_test.mjs`. Подробности, типы сообщений и
+ограничения — в `docs/telegram-notifications-v1.md`. Это не замена внешнему мониторингу доступности.
+
 ## Резервирование и перенос
 
 ```sh

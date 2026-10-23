@@ -215,7 +215,7 @@ async function withPipeline(run) {
     const row = id => sqlite.prepare("SELECT * FROM paper_trades WHERE forecast_id=?").get(id);
     const balance = () => sqlite.prepare("SELECT balance FROM paper_accounts").get().balance;
     const candle = (time, price) => ({ time, open: price, high: price + 0.1, low: price - 0.1, close: price, volume: 100, closed: true });
-    await run({ mod, sqlite, state, forecast, prior, row, balance, candle });
+    await run({ mod, sqlite, state, forecast, prior, row, balance, candle, instance });
   } finally { Date.now = originalNow; await instance.close(); sqlite.close(); delete globalThis[binding]; }
 }
 
@@ -321,5 +321,66 @@ test("correlation-group limit blocks a third instrument of one group until the u
     await mod.evaluatePaperTrades();
     assert.equal(row("new-f").status, "OPEN", "0 disables the rule");
     assert.deepEqual(payload.correlationGroups.map((group) => [group.id, group.count]), [["ru-oil", 2]]);
+  });
+});
+
+// Telegram notices for the paper pipeline: injected transport, no network.
+async function withTelegram(instance, run) {
+  const notifierModule = await instance.ssrLoadModule("/app/telegram-notifier.mjs");
+  const messages = [];
+  const notifier = notifierModule.createNotifier({
+    env: { TELEGRAM_BOT_TOKEN: "123456789:AAExampleExampleExampleExample_0123", TELEGRAM_CHAT_ID: "42" },
+    fetchImpl: async (_url, init) => { messages.push(JSON.parse(init.body).text); return { status: 200, json: async () => ({ ok: true }) }; },
+    sleep: async () => undefined,
+    logger: { warn: () => undefined, info: () => undefined },
+  });
+  notifierModule.setNotifier(notifier);
+  try { await run({ messages, flush: () => notifier.flush(1000) }); } finally { notifierModule.setNotifier(null); }
+}
+
+test("Telegram: an automatic entry and its stop-out are each announced exactly once", async () => {
+  await withPipeline(async ({ mod, state, forecast, row, candle, instance }) => {
+    await withTelegram(instance, async ({ messages, flush }) => {
+      forecast("new-f"); state.candles = [candle(T + D, 101)];
+      await mod.evaluatePaperTrades(); await flush();
+      assert.equal(row("new-f").status, "OPEN");
+      assert.equal(messages.length, 1, messages.join(" | "));
+      assert.match(messages[0], /✅ Открыта виртуальная сделка 🟢 LONG SNGSP · 4ч/);
+      assert.match(messages[0], /Вход: 100,00/); assert.match(messages[0], /TP: 103,00 · SL: 97,00/); assert.match(messages[0], /Автоматический вход/);
+
+      state.candles = [candle(T + D, 101), candle(T + 2 * D, 96)];
+      await mod.evaluatePaperTrades(); await flush();
+      assert.equal(row("new-f").status, "CLOSED"); assert.equal(row("new-f").exit_reason, "SL");
+      assert.equal(messages.length, 2, messages.join(" | "));
+      assert.match(messages[1], /🛑 Закрыта сделка 🟢 LONG SNGSP: −/); assert.match(messages[1], /сработал стоп/);
+
+      await mod.evaluatePaperTrades(); await flush();
+      assert.equal(messages.length, 2, "a repeated pass must not repeat the notices");
+    });
+  });
+});
+
+test("Telegram: a blocked entry is announced once, not on every one-minute pass", async () => {
+  await withPipeline(async ({ mod, sqlite, state, forecast, candle, instance }) => {
+    await withTelegram(instance, async ({ messages, flush }) => {
+      const insert = (table, values) => sqlite.prepare(`INSERT INTO ${table} (${Object.keys(values).join(",")}) VALUES (${Object.keys(values).map(() => "?").join(",")})`).run(...Object.values(values));
+      for (const symbol of ["LKOH", "ROSN"]) {
+        forecast(`${symbol}-f`, { symbol, asof_time: T - 8 * 3600_000 });
+        insert("paper_trades", { id: symbol, forecast_id: `${symbol}-f`, account_id: "northstar-paper-default",
+          model_version: modelVersion, symbol, market: "moex", timeframe: "4h", status: "OPEN", side: "LONG",
+          entry_source: "AUTO", quote_currency: "RUB", fx_rate: 80, signal_time: T - 8 * 3600_000,
+          due_time: T + 86400_000, entry_time: T - 4 * 3600_000, first_entry_time: T - 4 * 3600_000,
+          entry_time_source: "SIGNAL_PRICE", entry_price: 100, target_price: 110, stop_price: 95,
+          quantity: 1, notional: 100, risk_amount: 5, fees: 0, fees_native: 0, fee_bps: 5, slippage_bps: 3,
+          last_processed_time: T - 2 * D, created_at: T - 4 * 3600_000, updated_at: T - 2 * D });
+      }
+      forecast("new-f"); state.candles = [candle(T - D, 100), candle(T + D, 101)];
+      await mod.evaluatePaperTrades(); await flush();
+      const skipped = () => messages.filter((text) => text.startsWith("⏸"));
+      assert.equal(skipped().length, 1, messages.join(" | "));
+      assert.match(skipped()[0], /Сигнал 🟢 LONG SNGSP · 4ч есть, но вход не выполнен: Лимит группы «Нефть и газ РФ»: уже 2 из 2/);
+      await mod.evaluatePaperTrades(); await mod.evaluatePaperTrades(); await flush();
+      assert.equal(skipped().length, 1, "the same block is not announced again");
+    });
   });
 });

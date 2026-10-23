@@ -3,6 +3,7 @@ import { spawn } from 'node:child_process';
 import { startProdServer } from 'vinext/server/prod-server';
 import { serverSettings, authorize, safeBrowserRequest } from '../server/security.mjs';
 import { env } from '../server/bindings.mjs';
+import { formatServerStarted, getNotifier, notifySafely } from '../app/telegram-notifier.mjs';
 
 const config = serverSettings();
 await env.DB.prepare('SELECT 1').first();
@@ -50,15 +51,18 @@ gateway.headersTimeout = 15_000;
 gateway.requestTimeout = 180_000;
 await new Promise((done, reject) => { gateway.once('error', reject); gateway.listen(config.port, config.host, done); });
 console.log(`Northstar server: ${config.host}:${config.port}; paper only; automation ${automationEnabled ? 'enabled' : 'disabled'}`);
+notifySafely('alert', () => formatServerStarted({ automation: automationEnabled, notifyKinds: getNotifier().settings.kinds }));
 
 async function stop(code = 0) {
   if (stopping) return;
   stopping = true;
+  notifySafely('alert', () => code === 0 ? '🛑 Northstar остановлен' : '💀 Northstar остановлен из-за ошибки, супервизор перезапустит его');
   daemon?.kill('SIGTERM');
   const deadline = setTimeout(() => process.exit(code), 15_000);
   deadline.unref();
   await Promise.all([new Promise(r => gateway.close(r)), new Promise(r => backend.close(r))]);
   env.DB.close();
+  await getNotifier().flush(3000);
   process.exit(code);
 }
 process.on('SIGTERM', () => void stop());
