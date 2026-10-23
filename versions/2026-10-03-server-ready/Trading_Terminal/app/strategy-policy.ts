@@ -19,6 +19,8 @@ export const STRATEGY_ROLES: Record<ForecastStrategyId, { role: StrategyRole; re
   "opening-range-3": { role: "SHADOW", reason: "Недостаточно проверенных самостоятельных сделок" },
   "ema-window-channel": { role: "SHADOW", reason: "Исследование канала продолжается" },
   "macd-ema-topdown": { role: "SHADOW", reason: "Исследование старших ТФ продолжается" },
+  "trend-pullback": { role: "SHADOW", reason: "Ранний вход на откате к EMA20 по тренду старшего ТФ; набор теневой статистики" },
+  "squeeze-breakout": { role: "SHADOW", reason: "Ранний вход на пробое после сжатия по тренду старшего ТФ; набор теневой статистики" },
 };
 
 export const STRATEGY_ROLE_LABELS: Record<StrategyRole, string> = {

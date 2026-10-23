@@ -279,3 +279,47 @@ test("expired queued AUTO signals are not restored as newly opened positions", a
     assert.equal(row("new-f").entry_price, null);
   });
 });
+
+test("AUTO entry stores the market cost profile on the trade; a legacy position keeps the flat account rate", async () => {
+  await withPipeline(async ({ mod, state, forecast, prior, row, candle }) => {
+    prior({ symbol: "LKOH" }); forecast("new-f"); state.candles = [candle(T + D, 101)];
+    await mod.evaluatePaperTrades();
+    const entered = row("new-f");
+    assert.equal(entered.status, "OPEN");
+    // MOEX profile: 5 bps commission + 3 bps slippage per side, no funding.
+    assert.deepEqual([entered.fee_bps, entered.slippage_bps, entered.funding_bps_per_8h], [5, 3, 0]);
+    assert.ok(Math.abs(entered.fees_native - entered.notional * 5 / 10_000) < 1e-9);
+    const legacy = row("prior-f");
+    assert.equal(legacy.fee_bps, null, "history is never re-priced");
+    const payload = await mod.readPaperTrading(false);
+    assert.equal(payload.trades.find((trade) => trade.forecastId === "prior-f").costSource, "ACCOUNT");
+    assert.equal(payload.trades.find((trade) => trade.forecastId === "new-f").costSource, "TRADE");
+    assert.equal(payload.account.costModel, "MARKET");
+  });
+});
+
+test("correlation-group limit blocks a third instrument of one group until the user raises or disables it", async () => {
+  await withPipeline(async ({ mod, sqlite, state, forecast, row, candle }) => {
+    const insert = (table, values) => sqlite.prepare(`INSERT INTO ${table} (${Object.keys(values).join(",")}) VALUES (${Object.keys(values).map(() => "?").join(",")})`).run(...Object.values(values));
+    for (const symbol of ["LKOH", "ROSN"]) {
+      forecast(`${symbol}-f`, { symbol, asof_time: T - 8 * 3600_000 });
+      insert("paper_trades", { id: symbol, forecast_id: `${symbol}-f`, account_id: "northstar-paper-default",
+        model_version: modelVersion, symbol, market: "moex", timeframe: "4h", status: "OPEN", side: "LONG",
+        entry_source: "AUTO", quote_currency: "RUB", fx_rate: 80, signal_time: T - 8 * 3600_000,
+        due_time: T + 86400_000, entry_time: T - 4 * 3600_000, first_entry_time: T - 4 * 3600_000,
+        entry_time_source: "SIGNAL_PRICE", entry_price: 100, target_price: 110, stop_price: 95,
+        quantity: 1, notional: 100, risk_amount: 5, fees: 0, fees_native: 0, fee_bps: 5, slippage_bps: 3,
+        last_processed_time: T - 2 * D, created_at: T - 4 * 3600_000, updated_at: T - 2 * D });
+    }
+    forecast("new-f"); state.candles = [candle(T - D, 100), candle(T + D, 101)];
+    await mod.evaluatePaperTrades();
+    assert.equal(row("new-f").status, "CANDIDATE");
+    assert.equal(row("new-f").entry_block_reason, "POSITION_LIMIT");
+    assert.match(row("new-f").entry_block_detail, /Лимит группы «Нефть и газ РФ»: уже 2 из 2/);
+    const payload = await mod.updatePaperSettings({ maxPositionsPerGroup: 0 });
+    assert.equal(payload.account.maxPositionsPerGroup, 0);
+    await mod.evaluatePaperTrades();
+    assert.equal(row("new-f").status, "OPEN", "0 disables the rule");
+    assert.deepEqual(payload.correlationGroups.map((group) => [group.id, group.count]), [["ru-oil", 2]]);
+  });
+});

@@ -3,6 +3,8 @@ import { ensureForecastSchema, evaluateDueForecasts } from "./forecast-journal-s
 import { getMarketSessionState, marketCandleCloseTime, nextMarketBarTime } from "./market-calendar";
 import { SCENARIO_MODEL_VERSION } from "./terminal-forecast";
 import { policyAllowsPaperEntry, STRATEGY_POLICY_VERSION } from "./strategy-policy";
+import { correlationGroupExposure, correlationGroupLimitReason, DEFAULT_MAX_POSITIONS_PER_GROUP, MAX_POSITIONS_PER_GROUP_LIMIT } from "./correlation-groups";
+import { fundingCostPct, marketCostProfile } from "./market-costs";
 import type {
   Candle,
   ForecastDecision,
@@ -14,6 +16,7 @@ import type {
   Market,
   MarketRegime,
   PaperAccount,
+  PaperCostModel,
   PaperEntryMode,
   PaperEntryBlockReason,
   PaperEntrySource,
@@ -37,6 +40,7 @@ const DEFAULT_FEE_BPS = 10;
 const DEFAULT_SLIPPAGE_BPS = 5;
 const DEFAULT_MAX_POSITIONS = 5;
 const DEFAULT_ENTRY_MODE: PaperEntryMode = "MANUAL";
+const DEFAULT_COST_MODEL: PaperCostModel = "MARKET";
 const DEFAULT_RUB_PER_USDT = 80;
 const MAX_EXECUTION_HISTORY_GAP_MS = 30 * 60_000;
 const MAX_ENTRY_MARK_AGE_MS = 5 * 60_000;
@@ -86,6 +90,8 @@ const CREATE_ACCOUNT_TABLE = `CREATE TABLE IF NOT EXISTS paper_accounts (
   enabled INTEGER NOT NULL DEFAULT 1,
   entry_mode TEXT NOT NULL DEFAULT 'MANUAL',
   rub_per_usdt REAL NOT NULL DEFAULT 80,
+  cost_model TEXT NOT NULL DEFAULT 'MARKET',
+  max_positions_per_group INTEGER NOT NULL DEFAULT 2,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 )`;
@@ -120,6 +126,9 @@ const CREATE_TRADE_TABLE = `CREATE TABLE IF NOT EXISTS paper_trades (
   risk_amount REAL,
   fees REAL NOT NULL DEFAULT 0,
   fees_native REAL NOT NULL DEFAULT 0,
+  fee_bps REAL,
+  slippage_bps REAL,
+  funding_bps_per_8h REAL,
   realized_pnl REAL,
   realized_pnl_native REAL,
   pnl_pct REAL,
@@ -152,6 +161,8 @@ type AccountRow = {
   enabled: number;
   entry_mode: PaperEntryMode;
   rub_per_usdt: number;
+  cost_model: PaperCostModel;
+  max_positions_per_group: number;
   created_at: number;
   updated_at: number;
 };
@@ -186,6 +197,9 @@ type TradeRow = {
   risk_amount: number | null;
   fees: number;
   fees_native: number;
+  fee_bps?: number | null;
+  slippage_bps?: number | null;
+  funding_bps_per_8h?: number | null;
   realized_pnl: number | null;
   realized_pnl_native: number | null;
   pnl_pct: number | null;
@@ -262,6 +276,36 @@ function applySlippage(price: number, side: PaperTradeSide, entering: boolean, s
   return price * (buying ? 1 + rate : 1 - rate);
 }
 
+export type PaperTradeCosts = { feeBps: number; slippageBps: number; fundingBpsPer8h: number; source: "TRADE" | "MARKET" | "ACCOUNT" };
+
+/**
+ * Costs of one paper trade. An entered trade keeps the costs stored at its entry.
+ * A trade that has not entered (candidate, skipped) uses the market profile in
+ * MARKET mode. Positions opened before per-trade costs keep the flat account rate
+ * they were opened with, so their history is never re-priced.
+ */
+export function paperTradeCosts(
+  account: Pick<AccountRow, "fee_bps" | "slippage_bps"> & { cost_model?: PaperCostModel | null },
+  trade: Pick<TradeRow, "market" | "symbol"> & Partial<Pick<TradeRow, "status" | "fee_bps" | "slippage_bps" | "funding_bps_per_8h" | "entry_price">>,
+  price?: number | null,
+): PaperTradeCosts {
+  if (trade.fee_bps != null && trade.slippage_bps != null && Number.isFinite(trade.fee_bps) && Number.isFinite(trade.slippage_bps)) {
+    const funding = Number(trade.funding_bps_per_8h ?? 0);
+    return { feeBps: trade.fee_bps, slippageBps: trade.slippage_bps, fundingBpsPer8h: Number.isFinite(funding) ? funding : 0, source: "TRADE" };
+  }
+  const notEntered = trade.status == null || trade.status === "CANDIDATE" || trade.status === "SKIPPED";
+  if (notEntered && account.cost_model === "MARKET") {
+    const profile = marketCostProfile(trade.market, trade.symbol, price ?? trade.entry_price ?? undefined);
+    return { feeBps: profile.feeBps, slippageBps: profile.slippageBps, fundingBpsPer8h: profile.fundingBpsPer8h, source: "MARKET" };
+  }
+  return { feeBps: account.fee_bps, slippageBps: account.slippage_bps, fundingBpsPer8h: 0, source: "ACCOUNT" };
+}
+
+function fundingNativeFor(notional: number, fundingBpsPer8h: number | undefined, sinceTime: number | null | undefined, untilTime: number) {
+  if (!fundingBpsPer8h || sinceTime == null || !Number.isFinite(notional) || notional <= 0) return 0;
+  return notional * fundingCostPct(fundingBpsPer8h, untilTime - sinceTime) / 100;
+}
+
 function pnlAt(side: PaperTradeSide, entryPrice: number, exitPrice: number, quantity: number) {
   return (side === "LONG" ? exitPrice - entryPrice : entryPrice - exitPrice) * quantity;
 }
@@ -313,8 +357,11 @@ export function paperPortfolioCapacity(input: {
   market: Market;
   symbol: string;
   quotePerUsdt: number;
-  positions: Array<Pick<TradeRow, "id" | "market" | "symbol" | "side" | "entry_price" | "quantity" | "stop_price" | "fees_native" | "fx_rate">>;
+  positions: Array<Pick<TradeRow, "id" | "market" | "symbol" | "side" | "entry_price" | "quantity" | "stop_price" | "fees_native" | "fx_rate">
+    & Partial<Pick<TradeRow, "fee_bps" | "slippage_bps">>>;
   replacingStop?: { tradeId: string; stopPrice: number };
+  /** Distinct instruments allowed per correlation group; 0 or missing disables the rule. */
+  maxPositionsPerGroup?: number;
 }) {
   let riskUsdt = 0;
   let notionalUsdt = 0;
@@ -330,16 +377,19 @@ export function paperPortfolioCapacity(input: {
     }
     const nativeRisk = paperPositionStopRisk({ side: position.side, entryPrice: position.entry_price!,
       quantity: position.quantity!, stopPrice: input.replacingStop?.tradeId === position.id ? input.replacingStop.stopPrice : position.stop_price,
-      entryFeesNative: position.fees_native, feeBps: input.feeBps, slippageBps: input.slippageBps });
+      entryFeesNative: position.fees_native, feeBps: position.fee_bps ?? input.feeBps, slippageBps: position.slippage_bps ?? input.slippageBps });
     riskUsdt += Math.max(0, nativeRisk) / position.fx_rate;
     notionalUsdt += position.entry_price! * position.quantity! / position.fx_rate;
   }
   const symbolLimitHit = !symbols.has(`${input.market}:${input.symbol}`)
     && symbols.size >= Math.max(1, input.maxOpenPositions);
+  const groupLimitReason = correlationGroupLimitReason({ market: input.market, symbol: input.symbol },
+    input.positions, input.maxPositionsPerGroup ?? 0);
   const riskBudgetNative = Math.max(0, input.balance * PAPER_MAX_PORTFOLIO_RISK_PCT / 100 - riskUsdt) * input.quotePerUsdt;
   const notionalBudgetNative = Math.max(0, input.balance * PAPER_MAX_PORTFOLIO_NOTIONAL_PCT / 100 - notionalUsdt) * input.quotePerUsdt;
   const reason = !dataValid ? "Не удалось проверить экспозицию открытого портфеля"
     : symbolLimitHit ? "Достигнут лимит инструментов в открытом портфеле"
+      : groupLimitReason ? groupLimitReason
       : riskBudgetNative <= 1e-8 ? "Плановый риск открытого портфеля достиг 2% баланса"
         : notionalBudgetNative <= 1e-8 ? "Сумма открытого портфеля достигла 100% баланса" : null;
   return { allowed: reason == null, reason, riskUsdt, notionalUsdt,
@@ -353,7 +403,7 @@ async function candidatePortfolioCapacity(db: D1, account: AccountRow, trade: Tr
     .bind(ACCOUNT_ID, trade.id).all<TradeRow>();
   const capacity = paperPortfolioCapacity({ balance: account.balance, maxOpenPositions: account.max_open_positions,
     feeBps: account.fee_bps, slippageBps: account.slippage_bps, market: trade.market, symbol: trade.symbol,
-    quotePerUsdt, positions: positions.results ?? [], replacingStop });
+    quotePerUsdt, positions: positions.results ?? [], replacingStop, maxPositionsPerGroup: account.max_positions_per_group });
   if (!capacity.allowed) await blockCandidate(db, trade, "POSITION_LIMIT", capacity.reason!);
   return capacity;
 }
@@ -464,10 +514,11 @@ export function calculateManualPaperClose(input: {
   feeBps: number;
   slippageBps: number;
   quotePerUsdt: number;
+  fundingNative?: number;
 }) {
   const exitPrice = applySlippage(input.markPrice, input.side, false, input.slippageBps);
   const exitFeeNative = exitPrice * input.quantity * input.feeBps / 10_000;
-  const feesNative = input.entryFeesNative + exitFeeNative;
+  const feesNative = input.entryFeesNative + exitFeeNative + Math.max(0, input.fundingNative ?? 0);
   const realizedPnlNative = pnlAt(input.side, input.entryPrice, exitPrice, input.quantity) - feesNative;
   return {
     exitPrice,
@@ -595,6 +646,9 @@ export function simulatePaperPosition(input: {
   slippageBps: number;
   entryTime?: number;
   entryFeesNative?: number;
+  /** Perpetual funding estimate; accrues from `fundingSinceTime` (first entry) or `entryTime`. */
+  fundingBpsPer8h?: number;
+  fundingSinceTime?: number;
 }): PaperSimulation {
   const candles = input.candles.filter((candle) => candle.closed !== false
     && (input.entryTime == null || candle.time >= Math.ceil(input.entryTime / 60_000) * 60_000))
@@ -649,7 +703,8 @@ export function simulatePaperPosition(input: {
   if (rawExit != null && exitTime != null) {
     const exitPrice = applySlippage(rawExit, input.side, false, input.slippageBps);
     const exitFee = exitPrice * input.quantity * input.feeBps / 10_000;
-    const fees = entryFee + exitFee;
+    const funding = fundingNativeFor(notional, input.fundingBpsPer8h, input.fundingSinceTime ?? input.entryTime, exitTime);
+    const fees = entryFee + exitFee + funding;
     const realizedPnl = pnlAt(input.side, input.entryPrice, exitPrice, input.quantity) - fees;
     return {
       status: "CLOSED",
@@ -670,7 +725,9 @@ export function simulatePaperPosition(input: {
 
   const liquidationPrice = applySlippage(last.close, input.side, false, input.slippageBps);
   const estimatedExitFee = liquidationPrice * input.quantity * input.feeBps / 10_000;
-  const unrealizedPnl = pnlAt(input.side, input.entryPrice, liquidationPrice, input.quantity) - entryFee - estimatedExitFee;
+  // OPEN keeps `fees` = entry fee only: it is stored and fed back as entryFeesNative on the next pass.
+  const accruedFunding = fundingNativeFor(notional, input.fundingBpsPer8h, input.fundingSinceTime ?? input.entryTime, last.time + 60_000);
+  const unrealizedPnl = pnlAt(input.side, input.entryPrice, liquidationPrice, input.quantity) - entryFee - estimatedExitFee - accruedFunding;
   return {
     status: "OPEN",
     exitReason: null,
@@ -719,6 +776,11 @@ export async function ensurePaperSchema() {
   await ensureColumn(db, "paper_trades", "entry_block_reason", "TEXT");
   await ensureColumn(db, "paper_trades", "entry_block_detail", "TEXT");
   await ensureColumn(db, "paper_trades", "entry_blocked_at", "INTEGER");
+  await ensureColumn(db, "paper_trades", "fee_bps", "REAL");
+  await ensureColumn(db, "paper_trades", "slippage_bps", "REAL");
+  await ensureColumn(db, "paper_trades", "funding_bps_per_8h", "REAL");
+  await ensureColumn(db, "paper_accounts", "cost_model", `TEXT NOT NULL DEFAULT '${DEFAULT_COST_MODEL}'`);
+  await ensureColumn(db, "paper_accounts", "max_positions_per_group", `INTEGER NOT NULL DEFAULT ${DEFAULT_MAX_POSITIONS_PER_GROUP}`);
   const now = Date.now();
   await db.prepare(`INSERT INTO paper_accounts (
     id, name, initial_balance, balance, risk_per_trade_pct, fee_bps, slippage_bps,
@@ -915,17 +977,19 @@ async function mergeCandidateIntoOpenTrade(
   const capacity = await candidatePortfolioCapacity(db, account, candidate, quotePerUsdt,
     { tradeId: existing.id, stopPrice: candidate.stop_price });
   if (!capacity.allowed) return { evaluated: 0, balanceDelta: 0 };
+  // One position carries one cost set: the add-on inherits the existing position's costs.
+  const costs = paperTradeCosts(account, existing);
   const added = calculateManualPaperEntry({
     side: candidate.side, markPrice: entryCandle.open, targetPrice: candidate.target_price,
     stopPrice: candidate.stop_price, balance: account.balance, riskPerTradePct: account.risk_per_trade_pct,
-    maxOpenPositions: account.max_open_positions, feeBps: account.fee_bps,
-    slippageBps: account.slippage_bps, quotePerUsdt,
+    maxOpenPositions: account.max_open_positions, feeBps: costs.feeBps,
+    slippageBps: costs.slippageBps, quotePerUsdt,
     portfolioRiskBudgetNative: capacity.riskBudgetNative,
     portfolioNotionalBudgetNative: capacity.notionalBudgetNative,
     reservedNotionalNative: existing.entry_price * existing.quantity,
     reservedRiskNative: paperPositionStopRisk({ side: existing.side, entryPrice: existing.entry_price,
       stopPrice: candidate.stop_price, quantity: existing.quantity, entryFeesNative: existing.fees_native,
-      feeBps: account.fee_bps, slippageBps: account.slippage_bps }),
+      feeBps: costs.feeBps, slippageBps: costs.slippageBps }),
   });
   const addEntryPrice = added.entryPrice;
   const addQuantity = added.quantity;
@@ -947,7 +1011,7 @@ async function mergeCandidateIntoOpenTrade(
   const entryFeesNative = existing.fees_native + added.feesNative;
   const riskAmount = paperPositionStopRisk({ side: candidate.side, entryPrice: merged.entryPrice,
     stopPrice: candidate.stop_price, quantity: merged.quantity, entryFeesNative,
-    feeBps: account.fee_bps, slippageBps: account.slippage_bps });
+    feeBps: costs.feeBps, slippageBps: costs.slippageBps });
   const simulationWindow = closedCandles.filter((candle) => candle.time >= entryCandle.time);
   const simulation = simulatePaperPosition({
     side: candidate.side,
@@ -957,9 +1021,11 @@ async function mergeCandidateIntoOpenTrade(
     quantity: merged.quantity,
     dueTime: candidate.due_time,
     candles: simulationWindow,
-    feeBps: account.fee_bps,
-    slippageBps: account.slippage_bps,
+    feeBps: costs.feeBps,
+    slippageBps: costs.slippageBps,
     entryFeesNative,
+    fundingBpsPer8h: costs.fundingBpsPer8h,
+    fundingSinceTime: existing.first_entry_time ?? existing.entry_time ?? entryCandle.time,
   });
   const feesBase = quoteToPaperBalance(simulation.fees, quotePerUsdt) ?? 0;
   const realizedPnlBase = quoteToPaperBalance(simulation.realizedPnl, quotePerUsdt);
@@ -1036,11 +1102,13 @@ async function openAutomaticCandidateAtSignal(db: D1, account: AccountRow, trade
   let reservedNotionalNative = 0;
   for (const position of positions.results ?? []) {
     if (position.entry_price == null || position.quantity == null) continue;
+    const positionCosts = paperTradeCosts(account, position);
     reservedNotionalNative += position.entry_price * position.quantity;
     reservedRiskNative += paperPositionStopRisk({ side: position.side, entryPrice: position.entry_price,
       stopPrice: position.stop_price, quantity: position.quantity, entryFeesNative: position.fees_native,
-      feeBps: account.fee_bps, slippageBps: account.slippage_bps });
+      feeBps: positionCosts.feeBps, slippageBps: positionCosts.slippageBps });
   }
+  const costs = paperTradeCosts(account, trade, signalPrice);
   const riskCap = account.balance * Math.min(PAPER_MAX_ENTRY_RISK_PCT, account.risk_per_trade_pct) / 100 * currency.quotePerUsdt;
   const notionalCap = account.balance * Math.min(PAPER_MAX_ENTRY_NOTIONAL_PCT / 100, 1 / Math.max(1, account.max_open_positions)) * currency.quotePerUsdt;
   if (reservedRiskNative >= riskCap || reservedNotionalNative >= notionalCap) {
@@ -1063,8 +1131,8 @@ async function openAutomaticCandidateAtSignal(db: D1, account: AccountRow, trade
     balance: account.balance,
     riskPerTradePct: account.risk_per_trade_pct,
     maxOpenPositions: account.max_open_positions,
-    feeBps: account.fee_bps,
-    slippageBps: account.slippage_bps,
+    feeBps: costs.feeBps,
+    slippageBps: costs.slippageBps,
     quotePerUsdt: currency.quotePerUsdt,
     lotSize,
     reservedRiskNative,
@@ -1077,8 +1145,8 @@ async function openAutomaticCandidateAtSignal(db: D1, account: AccountRow, trade
     markPrice: signalPrice,
     targetPrice: trade.target_price,
     stopPrice: trade.stop_price,
-    feeBps: account.fee_bps,
-    slippageBps: account.slippage_bps,
+    feeBps: costs.feeBps,
+    slippageBps: costs.slippageBps,
     minimumNetRewardRisk: MINIMUM_ENTRY_NET_REWARD_RISK,
   });
   const executionWouldOpen = executionShadow.action === "OPEN";
@@ -1090,12 +1158,13 @@ async function openAutomaticCandidateAtSignal(db: D1, account: AccountRow, trade
     first_entry_time = ?, quote_currency = ?, fx_rate = ?, entry_price = ?, quantity = ?, notional = ?, risk_amount = ?,
     fees = ?, fees_native = ?, unrealized_pnl = ?, unrealized_pnl_native = ?, unrealized_pnl_pct = ?, last_price = ?,
     max_favorable_pct = 0, max_adverse_pct = 0, exit_reason = NULL, entry_block_reason = ?, entry_block_detail = ?,
-    entry_blocked_at = ?, last_processed_time = ?, updated_at = ? WHERE id = ? AND status = 'CANDIDATE'`).bind(
+    entry_blocked_at = ?, last_processed_time = ?, fee_bps = ?, slippage_bps = ?, funding_bps_per_8h = ?, updated_at = ?
+    WHERE id = ? AND status = 'CANDIDATE'`).bind(
       entryTime, entryTime, currency.quoteCurrency, currency.quotePerUsdt, entry.entryPrice,
       entry.quantity, entry.notional, entry.riskAmount, entry.fees, entry.feesNative, entry.unrealizedPnl,
       entry.unrealizedPnlNative, entry.unrealizedPnlPct, signalPrice,
       executionWouldOpen ? null : "WAIT_BETTER_PRICE", `[${PAPER_ENTRY_POLICY_VERSION}] ${shadowDetail}; статистический вход по закрытию свечи сигнала, сопровождение только после её закрытия`,
-      executionWouldOpen ? null : now, entryTime - 60_000, now, trade.id,
+      executionWouldOpen ? null : now, entryTime - 60_000, costs.feeBps, costs.slippageBps, costs.fundingBpsPer8h, now, trade.id,
     ).run();
   return Number(updated.meta.changes ?? 0) > 0;
 }
@@ -1183,13 +1252,14 @@ async function runOpenManualCandidateNow(db: D1, account: AccountRow, trade: Tra
     await skipTrade(db, trade.id, preEntryOutcome.outcome === "INVALIDATION" ? "PRE_ENTRY_INVALIDATION" : "TARGET_PASSED_BEFORE_ENTRY");
     return { evaluated: 1, balanceDelta: 0, openedNow: false };
   }
+  const costs = paperTradeCosts(account, trade, latest.close);
   const assessment = assessPaperCandidateEntry({
     side: trade.side,
     markPrice: latest.close,
     targetPrice: trade.target_price,
     stopPrice: trade.stop_price,
-    feeBps: account.fee_bps,
-    slippageBps: account.slippage_bps,
+    feeBps: costs.feeBps,
+    slippageBps: costs.slippageBps,
   });
   if (assessment.action === "SKIP_LOW_RR") {
     await skipTrade(db, trade.id, "LOW_NET_REWARD_RISK");
@@ -1221,6 +1291,7 @@ async function runOpenManualCandidateNow(db: D1, account: AccountRow, trade: Tra
       await skipTrade(db, trade.id, "OPPOSITE_POSITION");
       throw new Error("Нельзя докупить позицию в противоположную сторону");
     }
+    const positionCosts = paperTradeCosts(account, duplicate);
     const added = calculateManualPaperEntry({
       side: trade.side,
       markPrice: latest.close,
@@ -1229,8 +1300,8 @@ async function runOpenManualCandidateNow(db: D1, account: AccountRow, trade: Tra
       balance: account.balance,
       riskPerTradePct: account.risk_per_trade_pct,
       maxOpenPositions: account.max_open_positions,
-      feeBps: account.fee_bps,
-      slippageBps: account.slippage_bps,
+      feeBps: positionCosts.feeBps,
+      slippageBps: positionCosts.slippageBps,
       quotePerUsdt,
       lotSize,
       reservedNotionalNative: duplicate.notional,
@@ -1238,7 +1309,7 @@ async function runOpenManualCandidateNow(db: D1, account: AccountRow, trade: Tra
       portfolioNotionalBudgetNative: capacity.notionalBudgetNative,
       reservedRiskNative: paperPositionStopRisk({ side: duplicate.side, entryPrice: duplicate.entry_price,
         stopPrice: trade.stop_price, quantity: duplicate.quantity, entryFeesNative: duplicate.fees_native,
-        feeBps: account.fee_bps, slippageBps: account.slippage_bps }),
+        feeBps: positionCosts.feeBps, slippageBps: positionCosts.slippageBps }),
     });
     const merged = mergePaperPosition({
       currentEntryPrice: duplicate.entry_price,
@@ -1256,9 +1327,9 @@ async function runOpenManualCandidateNow(db: D1, account: AccountRow, trade: Tra
     const entryFeesNative = duplicate.fees_native + added.feesNative;
     const riskAmount = paperPositionStopRisk({ side: trade.side, entryPrice: merged.entryPrice,
       stopPrice: trade.stop_price, quantity: merged.quantity, entryFeesNative,
-      feeBps: account.fee_bps, slippageBps: account.slippage_bps });
-    const estimatedExitPrice = applySlippage(latest.close, trade.side, false, account.slippage_bps);
-    const estimatedExitFee = estimatedExitPrice * merged.quantity * account.fee_bps / 10_000;
+      feeBps: positionCosts.feeBps, slippageBps: positionCosts.slippageBps });
+    const estimatedExitPrice = applySlippage(latest.close, trade.side, false, positionCosts.slippageBps);
+    const estimatedExitFee = estimatedExitPrice * merged.quantity * positionCosts.feeBps / 10_000;
     const unrealizedPnlNative = pnlAt(trade.side, merged.entryPrice, estimatedExitPrice, merged.quantity) - entryFeesNative - estimatedExitFee;
     const unrealizedPnl = quoteToPaperBalance(unrealizedPnlNative, quotePerUsdt) ?? 0;
     await db.batch([
@@ -1295,10 +1366,10 @@ async function runOpenManualCandidateNow(db: D1, account: AccountRow, trade: Tra
     balance: account.balance,
     riskPerTradePct: account.risk_per_trade_pct,
     maxOpenPositions: account.max_open_positions,
-    feeBps: account.fee_bps,
+    feeBps: costs.feeBps,
     portfolioRiskBudgetNative: capacity.riskBudgetNative,
     portfolioNotionalBudgetNative: capacity.notionalBudgetNative,
-      slippageBps: account.slippage_bps,
+      slippageBps: costs.slippageBps,
       quotePerUsdt,
       lotSize,
     });
@@ -1306,10 +1377,11 @@ async function runOpenManualCandidateNow(db: D1, account: AccountRow, trade: Tra
     quantity = ?, notional = ?, risk_amount = ?, fees = ?, fees_native = ?, unrealized_pnl = ?,
     unrealized_pnl_native = ?, unrealized_pnl_pct = ?, last_price = ?, max_favorable_pct = 0,
     max_adverse_pct = 0, exit_reason = NULL, entry_block_reason = NULL, entry_block_detail = NULL, entry_blocked_at = NULL,
-    last_processed_time = ?, updated_at = ?
+    last_processed_time = ?, fee_bps = ?, slippage_bps = ?, funding_bps_per_8h = ?, updated_at = ?
     WHERE id = ? AND status = 'CANDIDATE'`).bind(
     entryTimestamp, entryTimeSource, entryTimestamp, currency.quoteCurrency, quotePerUsdt, entry.entryPrice, entry.quantity, entry.notional, entry.riskAmount, entry.fees, entry.feesNative,
-    entry.unrealizedPnl, entry.unrealizedPnlNative, entry.unrealizedPnlPct, latest.close, latest.time, now, trade.id,
+    entry.unrealizedPnl, entry.unrealizedPnlNative, entry.unrealizedPnlPct, latest.close, latest.time,
+    costs.feeBps, costs.slippageBps, costs.fundingBpsPer8h, now, trade.id,
   ).run();
   return { evaluated: 1, balanceDelta: 0, openedNow: true, addedNow: false, entryPrice: entry.entryPrice, entryTime: entryTimestamp };
 }
@@ -1344,6 +1416,7 @@ async function processTrade(db: D1, account: AccountRow, trade: TradeRow, execut
   const preciseStart = Math.max(Math.ceil(entryTime / 60_000) * 60_000, (trade.last_processed_time ?? 0) + 1);
   const preciseWindow = preciseClosed.filter((candle) => candle.time >= preciseStart);
   if (!preciseWindow.length) return { evaluated: 0, balanceDelta: 0 };
+  const costs = paperTradeCosts(account, trade);
   const simulation = simulatePaperPosition({
     side: trade.side,
     entryPrice,
@@ -1354,8 +1427,10 @@ async function processTrade(db: D1, account: AccountRow, trade: TradeRow, execut
     quantity,
     dueTime: trade.due_time,
     candles: preciseWindow,
-    feeBps: account.fee_bps,
-    slippageBps: account.slippage_bps,
+    feeBps: costs.feeBps,
+    slippageBps: costs.slippageBps,
+    fundingBpsPer8h: costs.fundingBpsPer8h,
+    fundingSinceTime: trade.first_entry_time ?? entryTime,
   });
   const feesBase = quoteToPaperBalance(simulation.fees, quotePerUsdt) ?? 0;
   const realizedPnlBase = quoteToPaperBalance(simulation.realizedPnl, quotePerUsdt);
@@ -1485,6 +1560,7 @@ export function calculateShadowForecastResult(input: {
 }
 
 function mapTradeWithAccount(row: TradeRow, account: AccountRow): PaperTrade {
+  const costs = paperTradeCosts(account, row, row.entry_price ?? row.shadow_entry_price ?? null);
   const shadow = row.status === "SKIPPED" && row.shadow_forecast_status === "EVALUATED"
     ? calculateShadowForecastResult({
         side: row.side,
@@ -1493,8 +1569,8 @@ function mapTradeWithAccount(row: TradeRow, account: AccountRow): PaperTrade {
         targetPrice: row.target_price,
         stopPrice: row.stop_price,
         firstTouch: row.shadow_first_touch,
-        feeBps: account.fee_bps,
-        slippageBps: account.slippage_bps,
+        feeBps: costs.feeBps,
+        slippageBps: costs.slippageBps,
       })
     : null;
   return {
@@ -1551,6 +1627,10 @@ function mapTradeWithAccount(row: TradeRow, account: AccountRow): PaperTrade {
     shadowTargetHit: row.shadow_target_hit == null ? null : Boolean(row.shadow_target_hit),
     shadowInvalidationHit: row.shadow_invalidation_hit == null ? null : Boolean(row.shadow_invalidation_hit),
     shadowFirstTouch: row.shadow_first_touch ?? null,
+    feeBps: costs.feeBps,
+    slippageBps: costs.slippageBps,
+    fundingBpsPer8h: costs.fundingBpsPer8h,
+    costSource: costs.source,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -1933,7 +2013,9 @@ async function payload(db: D1, queuedNow: number, evaluatedNow: number): Promise
     riskPerTradePct: account.risk_per_trade_pct,
     feeBps: account.fee_bps,
     slippageBps: account.slippage_bps,
+    costModel: account.cost_model === "FLAT" ? "FLAT" : "MARKET",
     maxOpenPositions: account.max_open_positions,
+    maxPositionsPerGroup: account.max_positions_per_group,
     enabled: Boolean(account.enabled),
     entryMode: account.entry_mode,
     rubPerUsdt: account.rub_per_usdt,
@@ -1942,6 +2024,7 @@ async function payload(db: D1, queuedNow: number, evaluatedNow: number): Promise
   };
   return {
     account: mappedAccount,
+    correlationGroups: correlationGroupExposure(trades.filter((trade) => trade.status === "OPEN")),
     analysisVersion: SCENARIO_MODEL_VERSION,
     currentVersionSummary,
     summary: {
@@ -2114,6 +2197,8 @@ async function runClosePaperTrade(tradeId: string) {
   const quotePerUsdt = trade.fx_rate > 0
     ? trade.fx_rate
     : paperCurrency(trade.market, account.rub_per_usdt, trade.symbol, latest.close).quotePerUsdt;
+  const costs = paperTradeCosts(account, trade);
+  const closeTime = Date.now();
   const close = calculateManualPaperClose({
     side: trade.side,
     entryPrice: trade.entry_price,
@@ -2121,11 +2206,12 @@ async function runClosePaperTrade(tradeId: string) {
     quantity: trade.quantity,
     notional: trade.notional,
     entryFeesNative: trade.fees_native,
-    feeBps: account.fee_bps,
-    slippageBps: account.slippage_bps,
+    feeBps: costs.feeBps,
+    slippageBps: costs.slippageBps,
     quotePerUsdt,
+    fundingNative: fundingNativeFor(trade.notional, costs.fundingBpsPer8h, trade.first_entry_time ?? trade.entry_time, closeTime),
   });
-  const now = Date.now();
+  const now = closeTime;
   const results = await db.batch([
     db.prepare(`UPDATE paper_trades SET status = 'CLOSED', exit_time = ?, exit_time_source = 'MANUAL_ACTION', exit_price = ?, fees = ?, fees_native = ?,
       realized_pnl = ?, realized_pnl_native = ?, pnl_pct = ?, unrealized_pnl = NULL, unrealized_pnl_native = NULL,
@@ -2167,6 +2253,8 @@ export async function updatePaperSettings(settings: {
   feeBps?: number;
   slippageBps?: number;
   maxOpenPositions?: number;
+  costModel?: PaperCostModel;
+  maxPositionsPerGroup?: number;
 }) {
   const db = await ensurePaperSchema();
   const account = await accountRow(db);
@@ -2177,9 +2265,13 @@ export async function updatePaperSettings(settings: {
   const fee = settings.feeBps == null ? account.fee_bps : Math.min(100, Math.max(0, settings.feeBps));
   const slippage = settings.slippageBps == null ? account.slippage_bps : Math.min(100, Math.max(0, settings.slippageBps));
   const maxPositions = settings.maxOpenPositions == null ? account.max_open_positions : Math.min(25, Math.max(1, Math.round(settings.maxOpenPositions)));
+  const costModel: PaperCostModel = settings.costModel == null ? account.cost_model : settings.costModel === "FLAT" ? "FLAT" : "MARKET";
+  const maxPerGroup = settings.maxPositionsPerGroup == null ? account.max_positions_per_group
+    : Math.min(MAX_POSITIONS_PER_GROUP_LIMIT, Math.max(0, Math.round(settings.maxPositionsPerGroup)));
   await db.prepare(`UPDATE paper_accounts SET enabled = ?, entry_mode = ?, rub_per_usdt = ?,
-    risk_per_trade_pct = ?, fee_bps = ?, slippage_bps = ?, max_open_positions = ?, updated_at = ? WHERE id = ?`)
-    .bind(enabled ? 1 : 0, entryMode, rubPerUsdt, risk, fee, slippage, maxPositions, Date.now(), ACCOUNT_ID).run();
+    risk_per_trade_pct = ?, fee_bps = ?, slippage_bps = ?, max_open_positions = ?, cost_model = ?,
+    max_positions_per_group = ?, updated_at = ? WHERE id = ?`)
+    .bind(enabled ? 1 : 0, entryMode, rubPerUsdt, risk, fee, slippage, maxPositions, costModel, maxPerGroup, Date.now(), ACCOUNT_ID).run();
   const queued = enabled && entryMode === "AUTO" ? await syncPaperCandidates() : 0;
   return payload(db, queued, 0);
 }

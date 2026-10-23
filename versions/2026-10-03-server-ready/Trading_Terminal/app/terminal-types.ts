@@ -135,7 +135,7 @@ export type IndicatorPack = {
 export type ForecastDirection = "BULL" | "SIDEWAYS" | "BEAR";
 export type ForecastDecision = "READY" | "WAIT_CONFIRMATION" | "NO_TRADE";
 export type MarketRegime = "TREND_UP" | "TREND_DOWN" | "RANGE" | "COMPRESSION" | "TRANSITION";
-export type ForecastStrategyId = "ema-macd-selective" | "ema-corridor" | "ema-window-channel" | "legacy-macd" | "macd-exhaustion" | "macd-ema-topdown" | "opening-range-3" | "mtf-entry" | "nison" | "vpa" | "level-action" | "scenario-forecast";
+export type ForecastStrategyId = "ema-macd-selective" | "ema-corridor" | "ema-window-channel" | "legacy-macd" | "macd-exhaustion" | "macd-ema-topdown" | "opening-range-3" | "mtf-entry" | "nison" | "vpa" | "level-action" | "scenario-forecast" | "trend-pullback" | "squeeze-breakout";
 export type ForecastStrategyTone = "violet" | "blue" | "cyan" | "rose" | "teal" | "amber" | "lime" | "gold" | "slate";
 
 export type VpaEventId = "CONFIRMED_IMPULSE" | "WEAK_PULLBACK" | "ABSORPTION" | "STOPPING_VOLUME" | "CONFIRMED_BREAKOUT" | "FALSE_BREAKOUT" | "NEUTRAL";
@@ -337,6 +337,7 @@ export type ForecastStrategyMatch = {
   topDownMacdEma?: TopDownMacdEmaSnapshot;
   windowStudy?: import("./ema-window-study").EmaWindowStudy;
   experimental?: boolean;
+  researchVersion?: string;
   trial?: ForecastStrategyTrial;
 };
 
@@ -481,6 +482,12 @@ export type ForecastJournalPayload = {
     avgTrialWinPct: number | null;
     avgTrialLossPct: number | null;
     trialProfitFactor: number | null;
+    /** Same trials after market costs (commission, spread/slippage, funding), see market-costs.ts. */
+    avgTrialNetReturnPct: number | null;
+    trialNetProfitFactor: number | null;
+    /** Average result in units of the trial's initial risk (entry→stop), before and after costs. */
+    avgTrialR: number | null;
+    avgTrialNetR: number | null;
     sampleSufficient: boolean;
     promotionCandidate: boolean;
     shadowVariants: Array<{
@@ -516,6 +523,8 @@ export type ForecastJournalPayload = {
 export type PaperTradeStatus = "CANDIDATE" | "OPEN" | "CLOSED" | "SKIPPED" | "MERGED" | "VOIDED";
 export type PaperTradeSide = "LONG" | "SHORT";
 export type PaperEntryMode = "MANUAL" | "AUTO";
+/** MARKET: per-market commission/spread/funding stored on each new trade; FLAT: one account-wide rate. */
+export type PaperCostModel = "MARKET" | "FLAT";
 export type PaperEntrySource = "MANUAL" | "MANUAL_WAIT" | "MANUAL_ADD" | "AUTO";
 export type PaperEntryBlockReason = "STRATEGY_DISABLED" | "MARKET_CLOSED" | "QUOTE_UNAVAILABLE" | "STALE_QUOTE" | "WAIT_BETTER_PRICE" | "PRICE_OUTSIDE_LEVELS" | "POSITION_LIMIT" | "DUPLICATE_SYMBOL" | null;
 export type PaperQuoteCurrency = "USDT" | "USD" | "RUB" | "JPY" | "CHF" | "CAD";
@@ -532,7 +541,10 @@ export type PaperAccount = {
   riskPerTradePct: number;
   feeBps: number;
   slippageBps: number;
+  costModel: PaperCostModel;
   maxOpenPositions: number;
+  /** Maximum distinct instruments per correlation group; 0 disables the rule. */
+  maxPositionsPerGroup: number;
   enabled: boolean;
   entryMode: PaperEntryMode;
   rubPerUsdt: number;
@@ -590,6 +602,11 @@ export type PaperTrade = {
   shadowGrossResultPct: number | null;
   shadowResultPct: number | null;
   shadowEstimatedCostPct: number | null;
+  /** Costs applied to this trade: stored at entry, or the account/market rule before entry. */
+  feeBps: number;
+  slippageBps: number;
+  fundingBpsPer8h: number;
+  costSource: "TRADE" | "MARKET" | "ACCOUNT";
   shadowOutcome: PaperShadowOutcome | null;
   shadowTargetHit: boolean | null;
   shadowInvalidationHit: boolean | null;
@@ -600,6 +617,8 @@ export type PaperTrade = {
 
 export type PaperTradingPayload = {
   account: PaperAccount;
+  /** Open instruments per correlation group, used by the per-group position limit. */
+  correlationGroups: Array<{ id: string; label: string; count: number; symbols: string[] }>;
   analysisVersion: string;
   currentVersionSummary: {
     total: number;

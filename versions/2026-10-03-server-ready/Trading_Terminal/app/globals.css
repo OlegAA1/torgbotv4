@@ -784,13 +784,14 @@ h1, h2, p { margin-top: 0; }
 .paper-equity-equation strong { font-family: var(--mono); font-size: 11px; }
 .paper-equity-equation i { color: #557083; font-family: var(--mono); font-size: 15px; font-style: normal; }
 .paper-equity-equation em { margin-left: auto; color: var(--muted); font-size: 9px; font-style: normal; }
-.paper-settings { display: grid; grid-template-columns: minmax(230px, 1.4fr) repeat(5, minmax(105px, .65fr)) auto; align-items: end; gap: 12px; margin-top: 18px; padding: 14px; border: 1px solid var(--line); background: #0a1018; }
+.paper-settings { display: grid; grid-template-columns: minmax(200px, 1.2fr) repeat(4, minmax(120px, 1fr)); align-items: end; gap: 12px; margin-top: 18px; padding: 14px; border: 1px solid var(--line); background: #0a1018; }
 .paper-settings > div strong, .paper-settings > div span { display: block; }
 .paper-settings > div strong { font-size: 11px; }
 .paper-settings > div span { margin-top: 5px; color: var(--muted); font-size: 9px; }
 .paper-settings label { display: grid; gap: 5px; }
 .paper-settings label span { color: var(--muted-2); font-size: 8px; letter-spacing: .04em; }
-.paper-settings input { width: 100%; height: 32px; padding: 0 9px; border: 1px solid var(--line); background: #0d151f; color: var(--text); font-family: var(--mono); }
+.paper-settings input, .paper-settings select { width: 100%; height: 32px; padding: 0 9px; border: 1px solid var(--line); background: #0d151f; color: var(--text); font-family: var(--mono); }
+.paper-settings .paper-group-exposure { grid-column: 1 / -1; color: var(--muted); font-size: 9px; line-height: 1.5; }
 .paper-trade-views { display: grid; grid-template-columns: repeat(3, minmax(150px, 1fr)); gap: 1px; margin-top: 18px; border: 1px solid var(--line); background: var(--line); }
 .paper-trade-views button { display: grid; grid-template-columns: 1fr auto; gap: 4px 12px; min-height: 58px; padding: 10px 12px; border: 0; background: #0a1018; color: var(--muted); text-align: left; cursor: pointer; }
 .paper-trade-views button:hover { background: #0f1822; }

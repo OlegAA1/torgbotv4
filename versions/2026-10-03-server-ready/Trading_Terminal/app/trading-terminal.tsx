@@ -14,7 +14,7 @@ import { buildForecast } from "./terminal-forecast";
 import { PAPER_PILOT_LABEL, STRATEGY_POLICY_VERSION, STRATEGY_ROLES, STRATEGY_ROLE_LABELS } from "./strategy-policy";
 import { currentMacdState, formatPrice, formingPatternDetails, indicators, latestPatternDetails } from "./terminal-math";
 import type { InstrumentSuggestion } from "./instrument-search-service";
-import type { Asset, Candle, ForecastDirection, ForecastJournalPayload, ForecastJournalRecord, ForecastStrategyId, ForecastStrategyMatch, LevelActionSnapshot, Market, MarketNewsPayload, NewsCategory, NewsImportance, NewsSentiment, PaperEntryMode, PaperTrade, PaperTradeExitReason, PaperTradeTimeSource, PaperTradingPayload, SignalIdea, Snapshot, Strategy, Timeframe, TradeMarker, VpaSnapshot } from "./terminal-types";
+import type { Asset, Candle, ForecastDirection, ForecastJournalPayload, ForecastJournalRecord, ForecastStrategyId, ForecastStrategyMatch, LevelActionSnapshot, Market, MarketNewsPayload, NewsCategory, NewsImportance, NewsSentiment, PaperCostModel, PaperEntryMode, PaperTrade, PaperTradeExitReason, PaperTradeTimeSource, PaperTradingPayload, SignalIdea, Snapshot, Strategy, Timeframe, TradeMarker, VpaSnapshot } from "./terminal-types";
 import { defaultExpansionAssets, normalizeUserTicker, savedAssetToAsset, sortWatchlistAssets } from "./watchlist-preferences";
 import type { SavedWatchlistAsset, WatchlistSort } from "./watchlist-preferences";
 
@@ -74,6 +74,8 @@ const STRATEGY_FILTERS: Array<{ id: ForecastStrategyId; label: string; tone: For
   { id: "nison", label: "Нисон", tone: "amber" },
   { id: "vpa", label: "Объём и цена · VPA", tone: "lime" },
   { id: "level-action", label: "Уровни Герчика", tone: "gold" },
+  { id: "trend-pullback", label: "Откат к EMA по тренду", tone: "teal" },
+  { id: "squeeze-breakout", label: "Пробой после сжатия", tone: "amber" },
   { id: "scenario-forecast", label: "Сценарий", tone: "slate" },
 ];
 type JournalSortKey = "asofTime" | "symbol" | "timeframe" | "primary" | "targetReturn" | "status" | "actualReturn";
@@ -411,10 +413,10 @@ function paperMarkIsStale(trade: PaperTrade, now: number) {
 
 function estimatePaperMark(trade: PaperTrade, markPrice: number, account: PaperTradingPayload["account"]) {
   if (trade.entryPrice == null || trade.quantity == null || trade.notional == null || trade.notional <= 0) return null;
-  const slippageRate = account.slippageBps / 10_000;
+  const slippageRate = (trade.slippageBps ?? account.slippageBps) / 10_000;
   const exitPrice = markPrice * (trade.side === "SHORT" ? 1 + slippageRate : 1 - slippageRate);
   const grossNative = (trade.side === "LONG" ? exitPrice - trade.entryPrice : trade.entryPrice - exitPrice) * trade.quantity;
-  const exitFeeNative = exitPrice * trade.quantity * account.feeBps / 10_000;
+  const exitFeeNative = exitPrice * trade.quantity * (trade.feeBps ?? account.feeBps) / 10_000;
   const pnlNative = grossNative - trade.feesNative - exitFeeNative;
   return {
     exitPrice,
@@ -617,7 +619,7 @@ export function TradingTerminal() {
   const [paper, setPaper] = useState<PaperTradingPayload | null>(null);
   const [paperLoading, setPaperLoading] = useState(false);
   const [paperError, setPaperError] = useState<string | null>(null);
-  const [paperSettings, setPaperSettings] = useState({ riskPct: "1", feePct: "0.10", slippagePct: "0.05", maxPositions: "5", rubPerUsdt: "80" });
+  const [paperSettings, setPaperSettings] = useState<{ riskPct: string; feePct: string; slippagePct: string; maxPositions: string; rubPerUsdt: string; costModel: PaperCostModel; maxPerGroup: string }>({ riskPct: "1", feePct: "0.10", slippagePct: "0.05", maxPositions: "5", rubPerUsdt: "80", costModel: "MARKET", maxPerGroup: "2" });
   const [paperSettingsDirty, setPaperSettingsDirty] = useState(false);
   const [paperActionId, setPaperActionId] = useState<string | null>(null);
   const [paperTradeActionId, setPaperTradeActionId] = useState<string | null>(null);
@@ -1010,6 +1012,8 @@ export function TradingTerminal() {
           slippagePct: (payload.account.slippageBps / 100).toFixed(2),
           maxPositions: String(payload.account.maxOpenPositions),
           rubPerUsdt: payload.account.rubPerUsdt.toFixed(2),
+          costModel: payload.account.costModel ?? "MARKET",
+          maxPerGroup: String(payload.account.maxPositionsPerGroup ?? 2),
         });
       }
       setPaperError(null);
@@ -1034,6 +1038,8 @@ export function TradingTerminal() {
           feeBps: Number(paperSettings.feePct) * 100,
           slippageBps: Number(paperSettings.slippagePct) * 100,
           maxOpenPositions: Number(paperSettings.maxPositions),
+          costModel: paperSettings.costModel,
+          maxPositionsPerGroup: Number(paperSettings.maxPerGroup),
         }),
       });
       const payload = await response.json() as PaperTradingPayload & { error?: string };
@@ -1997,11 +2003,16 @@ export function TradingTerminal() {
               <div className="paper-settings">
                 <div><strong>Параметры новых сделок</strong><span>Изменения применяются только к последующим входам.</span></div>
                 <label><span>Риск на сделку, %</span><input type="number" min="0.1" max="5" step="0.1" value={paperSettings.riskPct} onChange={(event) => { setPaperSettings((value) => ({ ...value, riskPct: event.target.value })); setPaperSettingsDirty(true); }} /></label>
-                <label><span>Комиссия, % за сторону</span><input type="number" min="0" max="1" step="0.01" value={paperSettings.feePct} onChange={(event) => { setPaperSettings((value) => ({ ...value, feePct: event.target.value })); setPaperSettingsDirty(true); }} /></label>
-                <label><span>Проскальзывание, %</span><input type="number" min="0" max="1" step="0.01" value={paperSettings.slippagePct} onChange={(event) => { setPaperSettings((value) => ({ ...value, slippagePct: event.target.value })); setPaperSettingsDirty(true); }} /></label>
+                <label><span>Издержки сделки</span><select value={paperSettings.costModel} onChange={(event) => { setPaperSettings((value) => ({ ...value, costModel: event.target.value === "FLAT" ? "FLAT" : "MARKET" })); setPaperSettingsDirty(true); }}><option value="MARKET">По рынкам (комиссия, спред, funding)</option><option value="FLAT">Единая ставка ниже</option></select></label>
+                <label><span>{paperSettings.costModel === "FLAT" ? "Комиссия, % за сторону" : "Единая комиссия, % (не используется)"}</span><input type="number" min="0" max="1" step="0.01" value={paperSettings.feePct} onChange={(event) => { setPaperSettings((value) => ({ ...value, feePct: event.target.value })); setPaperSettingsDirty(true); }} /></label>
+                <label><span>{paperSettings.costModel === "FLAT" ? "Проскальзывание, %" : "Единое проскальзывание, % (не используется)"}</span><input type="number" min="0" max="1" step="0.01" value={paperSettings.slippagePct} onChange={(event) => { setPaperSettings((value) => ({ ...value, slippagePct: event.target.value })); setPaperSettingsDirty(true); }} /></label>
                 <label><span>Максимум позиций</span><input type="number" min="1" max="25" step="1" value={paperSettings.maxPositions} onChange={(event) => { setPaperSettings((value) => ({ ...value, maxPositions: event.target.value })); setPaperSettingsDirty(true); }} /></label>
+                <label><span>Макс. инструментов в группе корреляции (0 — без лимита)</span><input type="number" min="0" max="10" step="1" value={paperSettings.maxPerGroup} onChange={(event) => { setPaperSettings((value) => ({ ...value, maxPerGroup: event.target.value })); setPaperSettingsDirty(true); }} /></label>
                 <label><span>Виртуальный курс, ₽ за 1 USDT</span><input type="number" min="10" max="500" step="0.1" value={paperSettings.rubPerUsdt} onChange={(event) => { setPaperSettings((value) => ({ ...value, rubPerUsdt: event.target.value })); setPaperSettingsDirty(true); }} /></label>
                 <button className="primary-button" disabled={paperLoading || !paperSettingsDirty} onClick={() => void savePaperSettings()}>Сохранить</button>
+                <small className="paper-group-exposure">Группы корреляции открытых позиций: {(paper?.correlationGroups ?? []).length
+                  ? (paper?.correlationGroups ?? []).map((group) => `${group.label} ${group.count}${paper?.account.maxPositionsPerGroup ? `/${paper.account.maxPositionsPerGroup}` : ""}`).join(" · ")
+                  : "нет открытых позиций"}</small>
               </div>
 
               <div className="paper-trade-views" role="tablist" aria-label="Разделы виртуальных сделок">
@@ -2281,12 +2292,13 @@ export function TradingTerminal() {
               </section>
 
               <section className="research-block" aria-label="Теневые испытания стратегий">
-                <header><div><p className="eyebrow">ТЕНЕВЫЕ ИДЕИ</p><h3>Статистические сделки без влияния на баланс</h3></div><small>{journalLoading ? "Обновление…" : "Все записи текущей версии модели, а не только последние строки журнала."}</small></header>
-                <div className="research-table-wrap"><table className="research-stats-table shadow"><thead><tr><th>Стратегия</th><th>Все сигналы</th><th>Завершено</th><th>Win rate</th><th>Средний результат</th><th>Средняя победа</th><th>Средний убыток</th><th>PF</th><th>Статус</th></tr></thead><tbody>
+                <header><div><p className="eyebrow">ТЕНЕВЫЕ ИДЕИ</p><h3>Статистические сделки без влияния на баланс</h3></div><small>{journalLoading ? "Обновление…" : "Все записи текущей версии модели. Результат, победа, убыток и PF — до издержек; R и PF нетто — после комиссии, спреда и funding по рынку."}</small></header>
+                <div className="research-table-wrap"><table className="research-stats-table shadow"><thead><tr><th>Стратегия</th><th>Все сигналы</th><th>Завершено</th><th>Win rate</th><th>Средний результат</th><th>Средняя победа</th><th>Средний убыток</th><th>PF</th><th>R до издержек</th><th>R нетто</th><th>PF нетто</th><th>Статус</th></tr></thead><tbody>
                   {(journal?.byStrategy ?? []).filter((item) => item.trialEvaluated > 0 || item.confirmed > 0).map((item) => <tr key={item.id}>
                     <td><span className={`strategy-chip compact ${item.tone}`}><i />{item.label}</span></td><td>{item.total}</td><td>{item.trialEvaluated}</td>
                     <td>{item.trialWinRatePct == null ? "—" : `${item.trialWinRatePct.toFixed(1)}%`}</td>
                     <td className={(item.avgTrialReturnPct ?? 0) >= 0 ? "positive" : "negative"}>{fmtPercent(item.avgTrialReturnPct)}</td><td>{fmtPercent(item.avgTrialWinPct)}</td><td>{fmtPercent(item.avgTrialLossPct)}</td><td>{item.trialProfitFactor == null ? "—" : item.trialProfitFactor.toFixed(2)}</td>
+                    <td className={(item.avgTrialR ?? 0) >= 0 ? "positive" : "negative"}>{item.avgTrialR == null ? "—" : item.avgTrialR.toFixed(2)}</td><td className={(item.avgTrialNetR ?? 0) >= 0 ? "positive" : "negative"}>{item.avgTrialNetR == null ? "—" : item.avgTrialNetR.toFixed(2)}</td><td>{item.trialNetProfitFactor == null ? "—" : item.trialNetProfitFactor.toFixed(2)}</td>
                     <td><span className={`research-sample ${item.promotionCandidate ? "candidate" : item.sampleSufficient ? "enough" : "small"}`}>{item.promotionCandidate ? "Можно проверять дальше" : item.sampleSufficient ? "Выборка есть" : `Мало · ${Math.max(0, 30 - item.trialEvaluated)} до 30`}</span></td>
                   </tr>)}
                   {!journalLoading && !(journal?.byStrategy ?? []).some((item) => item.trialEvaluated > 0 || item.confirmed > 0) && <tr><td colSpan={9} className="empty-row">Завершённых теневых испытаний пока нет.</td></tr>}

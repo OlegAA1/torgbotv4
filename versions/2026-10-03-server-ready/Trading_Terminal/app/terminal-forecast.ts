@@ -5,6 +5,7 @@ import { analyzeVolumePrice } from "./vpa-analysis";
 import { analyzeLevelAction } from "./level-action-analysis";
 import { detectEmaWindowChannelShadow } from "./price-channel-shadow";
 import { attachWindowStudy } from "./ema-window-study";
+import { detectSqueezeBreakoutShadow, detectTrendPullbackShadow } from "./entry-shadow-strategies";
 import { strategyAgreement } from "./forecast-confluence";
 import { assessStrategyPolicy, PAPER_PILOT_LABEL } from "./strategy-policy";
 import type {
@@ -1082,6 +1083,9 @@ export function buildForecast(
   const macdExhaustion = detectMacdImpulseExhaustion(candles, timeframe);
   const topDownMacdEma = detectTopDownMacdEmaShadow(allTimeframes);
   const emaWindowChannel = detectEmaWindowChannelShadow(allTimeframes["15m"] ?? (timeframe === "15m" ? candles : []));
+  // Shadow-only earlier entries; they never vote on the pilot decision.
+  const trendPullback = detectTrendPullbackShadow(candles, timeframe, allTimeframes);
+  const squeezeBreakout = detectSqueezeBreakoutShadow(candles, timeframe, allTimeframes);
   const vpaMatch: ForecastStrategyMatch | null = vpa ? {
     id: "vpa",
     label: "Объём и цена · VPA",
@@ -1140,6 +1144,8 @@ export function buildForecast(
     ...(mtfEntry ? [mtfEntry] : []),
     ...(vpaMatch ? [vpaMatch] : []),
     ...(levelActionMatch ? [levelActionMatch] : []),
+    ...(trendPullback ? [trendPullback] : []),
+    ...(squeezeBreakout ? [squeezeBreakout] : []),
     {
       id: "scenario-forecast" as const,
       label: "Сценарный прогноз",

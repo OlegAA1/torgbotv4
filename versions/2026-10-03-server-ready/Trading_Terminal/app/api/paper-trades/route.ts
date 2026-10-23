@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { closePaperTrade, openPaperRecommendation, readPaperTrading, updatePaperSettings, voidPaperTrade } from "../../paper-trading-store";
-import type { PaperEntryMode } from "../../terminal-types";
+import type { PaperCostModel, PaperEntryMode } from "../../terminal-types";
 
 function json(payload: unknown, status = 200) {
   return NextResponse.json(payload, { status, headers: { "Cache-Control": "no-store, max-age=0" } });
@@ -29,6 +29,8 @@ export async function POST(request: NextRequest) {
       feeBps?: number;
       slippageBps?: number;
       maxOpenPositions?: number;
+      costModel?: PaperCostModel;
+      maxPositionsPerGroup?: number;
     };
     if (body.action === "open-recommendation") {
       if (!body.forecastId || !/^[a-zA-Z0-9-]{8,80}$/.test(body.forecastId)) return json({ error: "Некорректный прогноз" }, 400);
@@ -43,7 +45,8 @@ export async function POST(request: NextRequest) {
       return json(await voidPaperTrade(body.tradeId));
     }
     if (body.entryMode != null && !["MANUAL", "AUTO"].includes(body.entryMode)) return json({ error: "Некорректный режим входа" }, 400);
-    for (const value of [body.rubPerUsdt, body.riskPerTradePct, body.feeBps, body.slippageBps, body.maxOpenPositions]) {
+    if (body.costModel != null && !["MARKET", "FLAT"].includes(body.costModel)) return json({ error: "Некорректная модель издержек" }, 400);
+    for (const value of [body.rubPerUsdt, body.riskPerTradePct, body.feeBps, body.slippageBps, body.maxOpenPositions, body.maxPositionsPerGroup]) {
       if (value != null && !Number.isFinite(value)) return json({ error: "Некорректные параметры paper-счёта" }, 400);
     }
     return json(await updatePaperSettings(body));

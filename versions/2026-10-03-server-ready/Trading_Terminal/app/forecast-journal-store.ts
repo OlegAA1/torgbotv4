@@ -2,6 +2,7 @@ import { getExecutionMarketData, getMarketData, TIMEFRAME_MINUTES } from "./mark
 import { nextMarketBarTime, projectMarketTimes } from "./market-calendar";
 import { SCENARIO_MODEL_VERSION } from "./terminal-forecast";
 import { evaluateWindowStudy } from "./ema-window-study";
+import { trialCostAdjustedResult } from "./market-costs";
 // Use the same frozen-episode aggregation in the UI and in the read-only audit.
 import { summarizeWindowStudies } from "./ema-window-study-stats.mjs";
 import type {
@@ -1133,6 +1134,12 @@ export async function readForecastJournal(limit = 200): Promise<ForecastJournalP
     trialLossReturnTotal: number;
     trialGrossProfit: number;
     trialGrossLoss: number;
+    trialNetReturnTotal: number;
+    trialNetGrossProfit: number;
+    trialNetGrossLoss: number;
+    trialRTotal: number;
+    trialNetRTotal: number;
+    trialRCount: number;
     trialShadowVariants: ForecastStrategyShadowVariant[];
     trialKeys: Set<string>;
   };
@@ -1142,6 +1149,7 @@ export async function readForecastJournal(limit = 200): Promise<ForecastJournalP
       id: match.id, label: match.label, tone: match.tone, total: 0, evaluated: 0, correct: 0,
       confirmed: 0, trialEvaluated: 0, trialWins: 0, trialLosses: 0, trialReturnTotal: 0,
       trialWinReturnTotal: 0, trialLossReturnTotal: 0, trialGrossProfit: 0, trialGrossLoss: 0,
+      trialNetReturnTotal: 0, trialNetGrossProfit: 0, trialNetGrossLoss: 0, trialRTotal: 0, trialNetRTotal: 0, trialRCount: 0,
       trialShadowVariants: [], trialKeys: new Set<string>(),
     };
     current.total += 1;
@@ -1161,6 +1169,17 @@ export async function readForecastJournal(limit = 200): Promise<ForecastJournalP
       current.trialReturnTotal += trialReturn;
       if (trialReturn > 0) current.trialGrossProfit += trialReturn;
       if (trialReturn < 0) current.trialGrossLoss += Math.abs(trialReturn);
+      const economics = trialCostAdjustedResult({ market: record.market, symbol: record.symbol,
+        entryPrice: match.trial.entryPrice, stopPrice: match.trial.stopPrice, returnPct: trialReturn,
+        entryTime: match.trial.availableAt ?? match.trial.signalTime, exitTime: match.trial.result.exitTime });
+      current.trialNetReturnTotal += economics.netReturnPct;
+      if (economics.netReturnPct > 0) current.trialNetGrossProfit += economics.netReturnPct;
+      if (economics.netReturnPct < 0) current.trialNetGrossLoss += Math.abs(economics.netReturnPct);
+      if (economics.grossR != null && economics.netR != null) {
+        current.trialRTotal += economics.grossR;
+        current.trialNetRTotal += economics.netR;
+        current.trialRCount += 1;
+      }
       if (match.trial.result.outcome === "WIN") {
         current.trialWins += 1;
         current.trialWinReturnTotal += trialReturn;
@@ -1206,11 +1225,15 @@ export async function readForecastJournal(limit = 200): Promise<ForecastJournalP
       evaluated: Number(row.evaluated ?? 0),
       accuracyPct: row.accuracy_pct == null ? null : Number(row.accuracy_pct),
     })),
-    byStrategy: [...strategyMap.values()].map(({ trialReturnTotal, trialWinReturnTotal, trialLossReturnTotal, trialGrossProfit, trialGrossLoss, trialShadowVariants, trialKeys: _trialKeys, ...item }) => {
+    byStrategy: [...strategyMap.values()].map(({ trialReturnTotal, trialWinReturnTotal, trialLossReturnTotal, trialGrossProfit, trialGrossLoss,
+      trialNetReturnTotal, trialNetGrossProfit, trialNetGrossLoss, trialRTotal, trialNetRTotal, trialRCount,
+      trialShadowVariants, trialKeys: _trialKeys, ...item }) => {
       void _trialKeys;
       const sampleSufficient = item.trialEvaluated >= 30;
       const trialProfitFactor = trialGrossLoss > 0 ? trialGrossProfit / trialGrossLoss : null;
       const avgTrialReturnPct = item.trialEvaluated ? trialReturnTotal / item.trialEvaluated : null;
+      const trialNetProfitFactor = trialNetGrossLoss > 0 ? trialNetGrossProfit / trialNetGrossLoss : null;
+      const avgTrialNetR = trialRCount ? trialNetRTotal / trialRCount : null;
       return {
         ...item,
         accuracyPct: item.evaluated ? item.correct / item.evaluated * 100 : null,
@@ -1219,8 +1242,13 @@ export async function readForecastJournal(limit = 200): Promise<ForecastJournalP
         avgTrialWinPct: item.trialWins ? trialWinReturnTotal / item.trialWins : null,
         avgTrialLossPct: item.trialLosses ? trialLossReturnTotal / item.trialLosses : null,
         trialProfitFactor,
+        avgTrialNetReturnPct: item.trialEvaluated ? trialNetReturnTotal / item.trialEvaluated : null,
+        trialNetProfitFactor,
+        avgTrialR: trialRCount ? trialRTotal / trialRCount : null,
+        avgTrialNetR,
         sampleSufficient,
-        promotionCandidate: sampleSufficient && (trialProfitFactor ?? 0) > 1 && (avgTrialReturnPct ?? 0) > 0,
+        // Promotion is judged after market costs and in risk units, not on gross percent moves.
+        promotionCandidate: sampleSufficient && (trialNetProfitFactor ?? 0) > 1 && (avgTrialNetR ?? 0) > 0,
         shadowVariants: summarizeTrialShadowVariants(trialShadowVariants),
       };
     }).sort((left, right) => right.total - left.total),
